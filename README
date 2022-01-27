@@ -1,0 +1,74 @@
+XDP quirks on various drivers/envs
+==================================
+
+Q: My #CPUs is higher than the number of NIC channels (e.g. 128 CPUs vs 63
+   channels as pre-set maximums in ethtool -l).
+
+   XDP_REDIRECT results in partial drops as a result. The latter was observed
+   on mlx5 driver via:
+
+   # perf probe -m mlx5_core -a 'mlx5e_xdp_xmit_ret=mlx5e_xdp_xmit%return ret=%ax'
+   # perf record -e probe:mlx5e_xdp_xmit_ret__return -aR -g sleep 100
+   # perf script
+
+   [...]
+   swapper     0 [127]  3009.821900: probe:mlx5e_xdp_xmit_ret__return: (ffffffffc4060dd0 <- ffffffffabc61d33) ret=0xfffffffa
+   [...]
+
+   The [127] shows the CPU number, ret=0xfffffffa is -ENXIO from mlx5e_xdp_xmit().
+
+A: For mlx5 specifically, two things:
+
+  1) Driver limitation, solved in the commit below [1], since kernel 5.10.
+
+  2) Firmware / MSIX limitation, e.g. if ethtool -l shows 63 and not 64, we will
+     need to use mlx mst tools to allow more MSIX for the function.
+
+  A) Ensure latest NIC firmware is used, e.g:
+     https://www.mellanox.com/support/firmware/connectx5en
+
+  B) Install mft tools package:
+  Download: https://www.mellanox.com/products/adapter-software/firmware-tools
+
+  Start mst module:
+  Doc: https://docs.nvidia.com/networking/display/MFT4130/Linux
+  $ mst start
+  $ mst status
+
+  Query Current msix config:
+  Doc: https://docs.nvidia.com/networking/pages/viewpage.action?pageId=19798347
+  $ mlxconfig -d /dev/mst/mt4117_pciconf0 --enable_verbosity q | grep NUM_PF_MSIX
+
+  Set desired new MSIX for PF:
+  $ mlxconfig -d /dev/mst/mt4117_pciconf0 set NUM_PF_MSIX=128
+  $ reboot
+
+  Bump the number of channels via ethtool:
+  $ ethtool -L eth0 combined 128
+
+  In case the NIC only supports up to 127 combined channels, the IRQ affinity
+  script from this repo can be used to exclude CPU 128 from packet processing:
+  $ ./affinity.sh eth0 0-126
+
+  After that, no drops should be observed anymore.
+
+[1]
+
+commit 57c7fce14b1ad512a42abe33cb721a2ea3520d4b
+Author: Fan Li <fanl@mellanox.com>
+Date:   Mon Dec 16 14:46:15 2019 +0200
+
+    net/mlx5: Increase the max number of channels to 128
+    
+    Currently the max number of channels is limited to 64, which is half of
+    the indirection table size to allow some flexibility. But on servers
+    with more than 64 cores, users may want to utilize more queues.
+    
+    This patch increases the advertised max number of channels to 128 by
+    changing the ratio between channels and indirection table slots to 1:1.
+    At the same time, the driver still enable no more than 64 channels at
+    loading. Users can change it by ethtool afterwards.
+    
+    Signed-off-by: Fan Li <fanl@mellanox.com>
+    Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+    Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
